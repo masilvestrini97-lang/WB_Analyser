@@ -82,7 +82,7 @@ if uploaded_file is not None:
             net_profile = band_profile - local_background
             
             # L'intégration (Aire sous la courbe) en utilisant la règle des trapèzes
-            area = np.trapz(net_profile)
+            area = np.trapezoid(net_profile)
             
             st.success(f"**Intensité brute calculée (Aire) : {area:.2f}**")
             st.info(f"Bruit de fond local soustrait : {local_background:.2f}")

@@ -4,216 +4,169 @@ import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 import pandas as pd
-from scipy.signal import find_peaks
 import io
 
-# --- Initialisation de la mémoire (Session State) pour le tableau ---
-if 'results_df' not in st.session_state:
-    st.session_state.results_df = pd.DataFrame(columns=[
-        "Condition / Protéine", 
-        "X Absolu", 
-        "Y Absolu Début Piste", 
-        "Y Absolu Fin Piste",
-        "Position Pic Relative (Y)",
-        "Position Pic Absolue (Y)",
-        "Intensité brute (Aire)", 
-        "Bruit de fond Local"
-    ])
+# --- Liste standardisée de vos conditions ---
+CONDITIONS = [
+    "EV -", "EV 2", "EV 7", "EV 15",
+    "WT -", "WT 2", "WT 7", "WT 15",
+    "D776N -", "D776N 2", "D776N 7", "D776N 15"
+]
 
-# --- Configuration de la page ---
-st.set_page_config(page_title="Quantificateur WB V5 Semi-Auto", layout="wide")
-st.title("🔬 Quantificateur de Western Blot (V5 Semi-Automatique)")
-st.markdown("Utilisez les curseurs de gauche pour définir la zone de lecture (en rouge), puis réglez la **sensibilité de détection** pour que l'algorithme trouve vos pics à droite.")
+st.set_page_config(page_title="Quantificateur WB V7 Flexible", layout="wide")
+st.title("🔬 Quantificateur Haut Débit Flexible (12 Puits)")
+st.markdown("Ciblez la grille, puis ajustez **chaque piste individuellement** si nécessaire pour corriger la migration.")
 
-# --- Étape 1 : Chargement de l'image ---
+# --- Initialisation de la mémoire (Session State) pour les ajustements individuels ---
+if 'lane_adjustments' not in st.session_state:
+    # On stocke les décalages (offsets) X, Y-top et Y-bottom pour chaque puits
+    st.session_state.lane_adjustments = {i: {"dx": 0, "dy_top": 0, "dy_bottom": 0} for i in range(12)}
+
+# Fonction pour réinitialiser les ajustements
+def reset_adjustments():
+    st.session_state.lane_adjustments = {i: {"dx": 0, "dy_top": 0, "dy_bottom": 0} for i in range(12)}
+
 uploaded_file = st.file_uploader("Choisissez une image (JPG, PNG)", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    # Lecture de l'image
     image = Image.open(uploaded_file)
     img_array = np.array(image)
     
-    # Conversion en niveaux de gris si l'image est en couleur
     if len(img_array.shape) == 3:
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     else:
         gray = img_array
 
-    # Inversion des couleurs pour l'analyse (noir = intensité)
     inverted_img = 255 - gray
     height, width = inverted_img.shape
 
     col1, col2 = st.columns([1, 1])
 
     with col1:
-        st.subheader("1. Définir la Piste Active")
+        st.subheader("1. Placer et Ajuster la Grille")
         
-        # Curseurs pour définir le segment de lecture
-        x_center = st.slider("Position X", 0, width, int(width/2))
-        lane_y_range = st.slider(
-            "Plage Verticale de la Piste (Exclure les légendes)", 
-            0, height, (int(height*0.1), int(height*0.9)),
-            help="Ce segment rouge définit la zone d'où proviendra le profil d'intensité propre."
-        )
+        tab1, tab2 = st.tabs(["🏗️ Placement Global", "🔧 Ajustement Individuel"])
         
-        # Variables de plage Y
-        y_start, y_end = lane_y_range
-        
-        # Sécurité pour éviter les erreurs d'extraction
-        if y_end <= y_start + 1:
-            st.error("Veuillez sélectionner une plage verticale valide (début < fin).")
-            st.stop()
+        with tab1:
+            st.markdown("**Étape A :** Définir le contour de la grille et la zone verticale par défaut.")
+            x_first = st.slider("Axe X : Première piste (EV -)", 0, width, int(width*0.1))
+            x_last = st.slider("Axe X : Dernière piste (D776N 15)", 0, width, int(width*0.9))
             
-        # Dessin du segment rouge sur l'image pour visualisation
-        img_display = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-        cv2.line(img_display, (x_center, y_start), (x_center, y_end), (255, 0, 0), 4)
-        # Marques horizontales
-        cv2.line(img_display, (x_center-10, y_start), (x_center+10, y_start), (255, 0, 0), 4)
-        cv2.line(img_display, (x_center-10, y_end), (x_center+10, y_end), (255, 0, 0), 4)
-        
-        st.image(img_display, caption=f"Piste sélectionnée (X:{x_center}, Y:{y_start}-{y_end})", use_container_width=True)
+            global_y_range = st.slider(
+                "Axe Y : Encadrer la protéine (Zone par défaut)", 
+                0, height, (int(height*0.4), int(height*0.5)),
+                help="Ajustez pour le 'gros' de la rangée de bandes."
+            )
+            g_y_start, g_y_end = global_y_range
 
-    # --- Étape 2 : Extraction et Détection Semi-Automatique ---
-    # On n'extrait la colonne que dans la plage Y définie à gauche
-    full_col_profile = inverted_img[:, x_center]
-    active_profile = full_col_profile[y_start:y_end]
-    profile_len = len(active_profile)
+            if st.button("🗑️ Réinitialiser tous les ajustements individuels"):
+                reset_adjustments()
+                st.rerun()
+
+        with tab2:
+            st.markdown("**Étape B :** Si une piste a bougé (X) ou a migré plus haut/bas (Y), corrigez-la ici.")
+            
+            # Sélection du puits à corriger
+            well_to_adjust = st.selectbox(
+                "Sélectionner la piste à corriger", 
+                options=range(1, 13), 
+                format_func=lambda i: f"Puits {i} ({CONDITIONS[i-1]})"
+            )
+            idx = well_to_adjust - 1
+            
+            # Curseurs pour ajuster cette piste spécifique (relativement à la grille par défaut)
+            st.markdown(f"**Ajustement pour {CONDITIONS[idx]} :**")
+            current_adj = st.session_state.lane_adjustments[idx]
+            
+            new_dx = st.slider("Ajustement X précis (Pix)", -50, 50, current_adj["dx"], key=f"dx_{idx}")
+            new_dy_top = st.slider("Ajustement Y-Haut ( Pix)", -100, 100, current_adj["dy_top"], key=f"dyt_{idx}", help="Monter (négatif) ou descendre (positif) le haut de la ligne.")
+            new_dy_bottom = st.slider("Ajustement Y-Bas (Pix)", -100, 100, current_adj["dy_bottom"], key=f"dyb_{idx}", help="Monter (négatif) ou descendre (positif) le bas de la ligne.")
+            
+            # Mise à jour de la mémoire
+            st.session_state.lane_adjustments[idx] = {"dx": new_dx, "dy_top": new_dy_top, "dy_bottom": new_dy_bottom}
+
+        # --- CALCUL ET DESSIN DE LA GRILLE FLEXIBLE ---
+        # 1. Grille théorique de base (linspace)
+        base_x_positions = np.linspace(x_first, x_last, 12, dtype=int)
+        
+        # 2. Application des ajustements pour créer la grille RÉELLE
+        actual_lanes = []
+        for i, x_base in enumerate(base_x_positions):
+            adj = st.session_state.lane_adjustments[i]
+            actual_x = x_base + adj["dx"]
+            actual_y_start = g_y_start + adj["dy_top"]
+            actual_y_end = g_y_end + adj["dy_bottom"]
+            
+            # Sécurité pour ne pas sortir de l'image
+            actual_x = max(0, min(width, actual_x))
+            actual_y_start = max(0, min(height, actual_y_start))
+            actual_y_end = max(0, min(height, actual_y_end))
+            
+            actual_lanes.append({"x": actual_x, "y_start": actual_y_start, "y_end": actual_y_end})
+
+        # Dessin de la grille flexible
+        img_display = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        
+        # Rectangle global par défaut (pointillé)
+        cv2.rectangle(img_display, (x_first, g_y_start), (x_last, g_y_end), (100, 100, 100), 2, cv2.LINE_AA)
+        
+        # Dessiner les 12 segments FLEXIBLES
+        for i, lane in enumerate(actual_lanes):
+            # Couleur spéciale pour la piste en cours d'ajustement (Rouge) vs les autres (Bleu)
+            color = (0, 0, 255) if i == idx else (255, 0, 0)
+            thickness = 4 if i == idx else 2
+            
+            # Dessiner le segment de lecture
+            cv2.line(img_display, (lane["x"], lane["y_start"]), (lane["x"], lane["y_end"]), color, thickness)
+            
+            # Marqueurs de début/fin
+            cv2.circle(img_display, (lane["x"], lane["y_start"]), 5, color, -1)
+            cv2.circle(img_display, (lane["x"], lane["y_end"]), 5, color, thickness)
+            
+            # Petit numéro du puits
+            cv2.putText(img_display, str(i+1), (lane["x"]-15, lane["y_start"]-15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, thickness)
+
+        st.image(img_display, caption="Grille de lecture flexible ajustée", use_container_width=True)
 
     with col2:
-        st.subheader("2. Détection de Pics (Profil Vertical)")
+        st.subheader("2. Résultats Instantanés")
         
-        # --- NOUVEAUX CURSEURS DE DÉTECTION ---
-        threshold = st.slider(
-            "Sensibilité de détection (Intensité minimale)", 
-            0, 255, 30, 
-            help="Un pic doit dépasser ce niveau d'intensité pour être détecté. Augmentez pour filtrer le bruit."
-        )
-        min_width = st.slider(
-            "Largeur minimale du pic (en pixels Y)", 
-            1, 100, 10,
-            help="Un pic doit avoir au moins cette largeur pour être retenu. Utile pour filtrer les micro-bulles de 1 pixel."
-        )
-
-        # --- NOUVELLE FONCTION DE DÉTECTION (Scipy) ---
-        # `find_peaks` est l'outil parfait. Nous l'inversons car on cherche des bandes SOMBRES sur fond blanc.
-        peaks, properties = find_peaks(active_profile, height=threshold, width=min_width)
-        num_peaks = len(peaks)
-        
-        # Calcul des intensités brutes (Aire sous la courbe) pour chaque pic détecté
-        peaks_data = []
-        for i in range(num_peaks):
-            peak_relative_y = peaks[i]
-            # Récupération des bases du pic (gauche/droite) pour l'intégration, relatives au début du segment
-            peak_left_base = int(properties["left_bases"][i])
-            peak_right_base = int(properties["right_bases"][i])
+        # Calcul en boucle sur la grille FLEXIBLE
+        results_list = []
+        for i, lane in enumerate(actual_lanes):
+            # Extraction du profil de la bande pour cette piste SPÉCIFIQUE
+            band_profile = inverted_img[lane["y_start"]:lane["y_end"], lane["x"]]
             
-            # Extraction du profil de ce pic unique
-            band_profile = active_profile[peak_left_base:peak_right_base]
-            
-            # Calcul de l'intensité
-            local_background = np.min(band_profile) if len(band_profile) > 0 else 0
-            net_profile = band_profile - local_background
-            
-            # Règle des trapèzes pour une aire plus robuste (Numpy 2.0+ compatible)
-            if len(net_profile) > 0:
+            if len(band_profile) > 0:
+                local_background = np.min(band_profile)
+                net_profile = band_profile - local_background
                 area = np.trapezoid(net_profile)
-                
-                # Conversion en coordonnées absolues de l'image originale
-                abs_peak_y = y_start + peak_relative_y
-                
-                # Stockage des données
-                peaks_data.append({
-                    "X Absolu": x_center, 
-                    "Y Absolu Début Piste": y_start,
-                    "Y Absolu Fin Piste": y_end,
-                    "Position Pic Relative (Y)": peak_relative_y,
-                    "Position Pic Absolue (Y)": abs_peak_y,
-                    "Intensité brute (Aire)": round(area, 2),
-                    "Bruit de fond Local": round(local_background, 2)
-                })
-
-        # --- NOUVEAU GRAPHIQUE VERTICAL AMÉLIORÉ ---
-        fig, ax = plt.subplots(figsize=(4, 6)) # Plus haut que large
-        
-        # On inverse les axes : X devient l'intensité, Y devient la position relative
-        ax.plot(active_profile, range(profile_len), color='black', label="Profil d'intensité propre")
-        
-        # Colorier CHAQUE pic individuellement
-        for i in range(num_peaks):
-            peak_relative_y = peaks[i]
-            peak_left_base = int(properties["left_bases"][i])
-            peak_right_base = int(properties["right_bases"][i])
-            
-            # fill_betweenx permet de colorier horizontalement
-            ax.fill_betweenx(range(peak_left_base, peak_right_base), 0, active_profile[peak_left_base:peak_right_base], color='blue', alpha=0.3)
-            # Marqueur au sommet
-            ax.scatter(active_profile[peak_relative_y], peak_relative_y, color='blue', marker='o', s=50, edgecolors='white', linewidths=1)
-        
-        # On inverse l'axe Y pour que le point 0 (haut de la piste rouge) soit en haut
-        ax.set_ylim(profile_len, 0) 
-        # Limite de l'axe X (Intensité) propre
-        max_intensity = np.max(active_profile) if np.max(active_profile) > 0 else 255
-        ax.set_xlim(0, max_intensity * 1.1)
-        
-        ax.set_ylabel("Position Relative dans la Piste (Pixels)")
-        ax.set_xlabel("Intensité (noir = fort)")
-        
-        # Mise à jour de la légende
-        handles, labels = ax.get_legend_handles_labels()
-        if num_peaks > 0:
-            # On crée un faux marqueur pour la légende
-            h, = ax.plot([], [], color='blue', marker='o', linestyle='None')
-            handles.append(h)
-            labels.append(f"Pics détectés ({num_peaks})")
-        
-        ax.legend(handles, labels)
-        st.pyplot(fig)
-        
-        if num_peaks == 0:
-            st.warning("Aucun pic détecté avec la sensibilité actuelle. Essayez d'augmenter la sensibilité (Intensité minimale).")
-        else:
-            st.success(f"**{num_peaks} pics détectés.** Les résultats sont prêts à être enregistrés.")
-
-        # --- Étape 3 : Sauvegarde instantanée de TOUS les pics ---
-        st.markdown("---")
-        st.subheader("3. Enregistrer les résultats de cette piste")
-        band_base_name = st.text_input("Nom de base pour cette piste (ex: WT 7min)")
-        
-        if st.button("➕ Enregistrer TOUS les pics détectés"):
-            if band_base_name and len(peaks_data) > 0:
-                # Création d'un DataFrame temporaire avec les noms de pics numérotés
-                new_data_list = []
-                for idx, peak_data in enumerate(peaks_data):
-                    # Exemple de nom : "WT 7min (Pic 1 / 155 kDa)"
-                    peak_data_named = peak_data.copy()
-                    peak_data_named["Condition / Protéine"] = f"{band_base_name} (Pic {idx + 1})"
-                    new_data_list.append(peak_data_named)
-                
-                new_data_df = pd.DataFrame(new_data_list)
-                
-                # Ajout au tableau global
-                st.session_state.results_df = pd.concat([st.session_state.results_df, new_data_df], ignore_index=True)
-                st.toast("Pics enregistrés avec succès !")
             else:
-                if len(peaks_data) == 0:
-                    st.warning("Aucun pic à enregistrer. Réglez d'abord la sensibilité.")
-                else:
-                    st.warning("Veuillez entrer un nom de base pour cette piste.")
+                area, local_background = 0, 0
+                
+            results_list.append({
+                "Puits N°": i + 1,
+                "Condition": CONDITIONS[i],
+                "X Absolu": lane["x"],
+                "Y-Haut Absolu": lane["y_start"],
+                "Y-Bas Absolu": lane["y_end"],
+                "Intensité (AUC)": round(area, 2),
+                "Bruit de fond": round(local_background, 2)
+            })
 
-# --- Affichage et Export (inchangé) ---
-if not st.session_state.results_df.empty:
-    st.markdown("---")
-    st.subheader("📊 Tableau de vos résultats")
-    st.dataframe(st.session_state.results_df, use_container_width=True)
-    
-    csv = st.session_state.results_df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📥 Télécharger les résultats (CSV)",
-        data=csv,
-        file_name="quantification_ western_blot.csv",
-        mime="text/csv",
-    )
-    
-    if st.button("🗑️ Vider le tableau"):
-        st.session_state.results_df = st.session_state.results_df.iloc[0:0]
-        st.rerun()
+        # Création du DataFrame
+        df_results = pd.DataFrame(results_list)
+        
+        # Nom de la protéine pour l'export
+        protein_name = st.text_input("Protéine quantifiée (ex: p-PLCG1)", value="Protéine_Inconnue")
+        
+        st.dataframe(df_results, use_container_width=True)
+        
+        # Bouton d'export CSV
+        csv = df_results.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label=f"📥 Télécharger les 12 intensités ({protein_name})",
+            data=csv,
+            file_name=f"Quantification_{protein_name}.csv",
+            mime="text/csv",
+        )

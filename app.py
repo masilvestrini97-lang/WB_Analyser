@@ -72,4 +72,5 @@ if uploaded_file is not None:
         st.subheader("2. Isoler la Bande (Profil Vertical)")
         peak_y_range = st.slider(
             "Isoler le pic de protéine (Haut / Bas)", 
-            0, profile_len, (int(
+            0, profile_len, (int(profile_len*0.2), int(profile_len*0.4))
+        )

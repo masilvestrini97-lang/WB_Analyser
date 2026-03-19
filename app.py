@@ -3,17 +3,20 @@ import cv2
 import numpy as np
 from PIL import Image
 import pandas as pd
-from streamlit_drawable_canvas import st_canvas
 
 # --- Initialisation de la mémoire ---
 if 'results_df' not in st.session_state:
     st.session_state.results_df = pd.DataFrame(columns=[
         "Condition", "Bande", "Surface (Pixels²)", "Intensité brute", "Bruit de fond", "Intensité Nette"
     ])
+    
+# Nouvelle mémoire pour stocker nos boîtes 2D manuellement
+if 'saved_boxes' not in st.session_state:
+    st.session_state.saved_boxes = [] # Liste de dicts: {'y': int, 'h': int}
 
-st.set_page_config(page_title="Quantificateur WB V11 (Zoom & Toile)", layout="wide")
-st.title("🔬 Quantificateur 2D : Détection + Édition Manuelle")
-st.markdown("Laissez l'algorithme proposer des boîtes (à gauche), puis **ajustez-les confortablement sur l'image agrandie** (à droite).")
+st.set_page_config(page_title="Quantificateur WB V12 (Éditeur Natif)", layout="wide")
+st.title("🔬 Quantificateur 2D : Éditeur de Boîtes Natif")
+st.markdown("Fini les bugs de plugin ! Utilisez l'**Auto-détection**, puis ajustez ou ajoutez des boîtes avec le **Viseur Vert**.")
 
 uploaded_file = st.file_uploader("Choisissez une image (JPG, PNG)", type=["jpg", "jpeg", "png"])
 
@@ -48,119 +51,115 @@ if uploaded_file is not None:
     # Extraction
     lane_gray = gray[y_start:y_end, x_start:x_end]
     lane_inverted = inverted_img[y_start:y_end, x_start:x_end]
-    lane_rgb = cv2.cvtColor(lane_gray, cv2.COLOR_GRAY2RGB)
-    
-    canvas_height = int(lane_rgb.shape[0])
-    canvas_width = int(lane_rgb.shape[1])
+    lane_height, lane_width_actual = lane_gray.shape
 
     st.markdown("---")
-    col1, col2 = st.columns([1, 1.5])
+    col1, col2, col3 = st.columns([1, 1.5, 1])
 
     with col1:
         st.subheader("1. Auto-Détection")
-        threshold_val = st.slider("Sensibilité de pré-détection", 0, 255, 50)
+        threshold_val = st.slider("Sensibilité (Seuil)", 0, 255, 50)
         min_area = st.slider("Surface minimale", 10, 1000, 50)
-        
-        # --- NOUVEAU : LE ZOOM ---
-        st.markdown("---")
-        zoom_factor = st.slider("🔍 Zoom d'affichage (pour dessiner plus facilement)", 1, 5, 3)
         
         if st.button("🔄 Lancer l'Auto-Détection", type="primary"):
             _, binary_mask = cv2.threshold(lane_inverted, threshold_val, 255, cv2.THRESH_BINARY)
             contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            canvas_objects = []
+            new_boxes = []
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
                 if w * h >= min_area:
-                    # On multiplie les coordonnées par le Zoom pour l'affichage
-                    canvas_objects.append({
-                        "type": "rect",
-                        "left": float(x * zoom_factor), 
-                        "top": float(y * zoom_factor), 
-                        "width": float(w * zoom_factor), 
-                        "height": float(h * zoom_factor),
-                        "fill": "rgba(0, 0, 0, 0)",
-                        "stroke": "red",
-                        "strokeWidth": 2,
-                        "transparentCorners": False
-                    })
+                    # On stocke uniquement Y et H, le X et W sont définis par la largeur de la piste
+                    new_boxes.append({'y': y, 'h': h})
             
-            st.session_state["initial_drawing"] = {
-                "version": "4.4.0",
-                "objects": canvas_objects
-            }
+            st.session_state.saved_boxes = sorted(new_boxes, key=lambda b: b['y'])
+            st.rerun()
+            
+        if st.button("🗑️ Effacer toutes les boîtes"):
+            st.session_state.saved_boxes = []
             st.rerun()
 
-    with col2:
-        st.subheader("2. La Toile Interactive")
-        drawing_mode = st.radio("Outil actif :", ("transform", "rect"), horizontal=True, 
-                                format_func=lambda x: "🖱️ Modifier/Sélectionner" if x == "transform" else "✏️ Dessiner Nouvelle Boîte")
-
-        initial_state = st.session_state.get("initial_drawing", {"version": "4.4.0", "objects": []})
-
-        # Application du Zoom sur l'image de fond (INTER_NEAREST pour ne pas flouter les bandes)
-        lane_rgb_zoomed = cv2.resize(lane_rgb, (canvas_width * zoom_factor, canvas_height * zoom_factor), interpolation=cv2.INTER_NEAREST)
-        lane_pil_zoomed = Image.fromarray(lane_rgb_zoomed)
-
-        canvas_result = st_canvas(
-            fill_color="rgba(0, 0, 0, 0)",
-            stroke_width=2,
-            stroke_color="red",
-            background_image=lane_pil_zoomed,
-            update_streamlit=True,
-            height=canvas_height * zoom_factor, 
-            width=canvas_width * zoom_factor,
-            drawing_mode=drawing_mode,
-            initial_drawing=initial_state,
-            key="canvas",
-        )
-
-        st.markdown("---")
-        condition_name = st.text_input("Nom de la piste (ex: WT 7min)")
+    with col3:
+        st.subheader("2. Le Viseur (Ajout manuel)")
+        st.markdown("Ajustez la boîte **verte** pour encadrer une bande manquante.")
         
-        if st.button("✅ Calculer et Enregistrer ces Boîtes"):
-            if canvas_result.json_data is not None and len(canvas_result.json_data["objects"]) > 0:
-                detected_bands_data = []
-                band_counter = 1
+        # Le Viseur Vert
+        target_y = st.slider("Position Y (Haut-Bas)", 0, lane_height, int(lane_height/2))
+        target_h = st.slider("Épaisseur de la bande (Hauteur)", 2, 100, 20)
+        
+        if st.button("✅ Ajouter cette boîte verte"):
+            st.session_state.saved_boxes.append({'y': target_y, 'h': target_h})
+            # Trier les boîtes de haut en bas
+            st.session_state.saved_boxes = sorted(st.session_state.saved_boxes, key=lambda b: b['y'])
+            st.rerun()
+            
+        st.markdown("---")
+        st.markdown("**Correction / Suppression :**")
+        if len(st.session_state.saved_boxes) > 0:
+            box_to_delete = st.selectbox("Sélectionner une boîte à supprimer", range(len(st.session_state.saved_boxes)), format_func=lambda i: f"Boîte {i+1} (Y: {st.session_state.saved_boxes[i]['y']})")
+            if st.button("❌ Supprimer cette boîte"):
+                st.session_state.saved_boxes.pop(box_to_delete)
+                st.rerun()
+
+    with col2:
+        st.subheader("Aperçu en Direct")
+        
+        # Création de l'image d'affichage
+        display_img = cv2.cvtColor(lane_gray, cv2.COLOR_GRAY2RGB)
+        
+        # 1. Dessiner les boîtes sauvegardées (ROUGES)
+        for i, box in enumerate(st.session_state.saved_boxes):
+            cv2.rectangle(display_img, (0, box['y']), (lane_width_actual, box['y'] + box['h']), (0, 0, 255), 2)
+            cv2.putText(display_img, f"B{i+1}", (2, max(0, box['y']-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            
+        # 2. Dessiner le Viseur (VERT)
+        cv2.rectangle(display_img, (0, target_y), (lane_width_actual, target_y + target_h), (0, 255, 0), 2)
+        cv2.putText(display_img, "VISEUR", (2, min(lane_height-5, target_y + target_h + 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        # Zoom pour un meilleur confort visuel (purement cosmétique pour l'écran)
+        zoom_factor = 3
+        display_img_zoomed = cv2.resize(display_img, (lane_width_actual * zoom_factor, lane_height * zoom_factor), interpolation=cv2.INTER_NEAREST)
+        
+        st.image(display_img_zoomed, caption="Rouge = Sauvegardé | Vert = Viseur actif", use_container_width=True)
+
+    # --- CALCUL ET ENREGISTREMENT ---
+    st.markdown("---")
+    st.subheader("3. Enregistrer les résultats")
+    condition_name = st.text_input("Nom de la piste (ex: WT 7min)")
+    
+    if st.button("💾 Calculer et Enregistrer toutes les boîtes ROUGES", type="primary"):
+        if len(st.session_state.saved_boxes) > 0:
+            detected_bands_data = []
+            
+            for i, box in enumerate(st.session_state.saved_boxes):
+                y = box['y']
+                h = box['h']
+                w = lane_width_actual
+                area = float(w * h)
                 
-                objects = canvas_result.json_data["objects"]
-                objects = sorted(objects, key=lambda obj: obj["top"])
+                # Extraction sur l'image inversée pour le calcul
+                band_pixels = lane_inverted[y:y+h, 0:w]
                 
-                for obj in objects:
-                    if obj["type"] == "rect":
-                        # On DIVISE par le Zoom pour revenir aux vraies dimensions de l'image
-                        x = int(obj["left"] / zoom_factor)
-                        y = int(obj["top"] / zoom_factor)
-                        w = int((obj["width"] * obj.get("scaleX", 1)) / zoom_factor)
-                        h = int((obj["height"] * obj.get("scaleY", 1)) / zoom_factor)
-                        
-                        area = float(w * h)
-                        
-                        # Sécurité pour éviter les bugs si on dessine à l'envers ou hors cadre
-                        if area > 0 and w > 0 and h > 0:
-                            band_pixels = lane_inverted[max(0, y):max(0, y)+h, max(0, x):max(0, x)+w]
-                            raw_intden = np.sum(band_pixels, dtype=np.float64)
-                            
-                            local_bg = float(np.min(band_pixels)) if band_pixels.size > 0 else 0.0
-                            total_bg = local_bg * area
-                            net_intden = raw_intden - total_bg
-                            
-                            detected_bands_data.append({
-                                "Condition": condition_name if condition_name else "Inconnue",
-                                "Bande": f"Bande {band_counter}",
-                                "Surface (Pixels²)": round(area, 2),
-                                "Intensité brute": round(raw_intden, 2),
-                                "Bruit de fond": round(total_bg, 2),
-                                "Intensité Nette": round(net_intden, 2)
-                            })
-                            band_counter += 1
+                # Calcul 2D sécurisé
+                raw_intden = np.sum(band_pixels, dtype=np.float64)
+                local_bg = float(np.min(band_pixels)) if band_pixels.size > 0 else 0.0
+                total_bg = local_bg * area
+                net_intden = raw_intden - total_bg
                 
-                new_data_df = pd.DataFrame(detected_bands_data)
-                st.session_state.results_df = pd.concat([st.session_state.results_df, new_data_df], ignore_index=True)
-                st.success(f"{band_counter-1} bandes calculées et enregistrées !")
-            else:
-                st.warning("Aucune boîte n'est présente sur l'image.")
+                detected_bands_data.append({
+                    "Condition": condition_name if condition_name else "Inconnue",
+                    "Bande": f"Bande {i+1}",
+                    "Surface (Pixels²)": round(area, 2),
+                    "Intensité brute": round(raw_intden, 2),
+                    "Bruit de fond": round(total_bg, 2),
+                    "Intensité Nette": round(net_intden, 2)
+                })
+            
+            new_data_df = pd.DataFrame(detected_bands_data)
+            st.session_state.results_df = pd.concat([st.session_state.results_df, new_data_df], ignore_index=True)
+            st.success(f"{len(detected_bands_data)} bandes enregistrées !")
+        else:
+            st.warning("Aucune boîte rouge à calculer.")
 
 # --- AFFICHAGE ET EXPORT ---
 if not st.session_state.results_df.empty:
@@ -169,7 +168,7 @@ if not st.session_state.results_df.empty:
     st.dataframe(st.session_state.results_df, use_container_width=True)
     
     csv = st.session_state.results_df.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Télécharger (CSV)", data=csv, file_name="Quantification_2D_Zoom.csv", mime="text/csv")
+    st.download_button("📥 Télécharger (CSV)", data=csv, file_name="Quantification_2D_Native.csv", mime="text/csv")
     
     if st.button("🗑️ Vider le tableau"):
         st.session_state.results_df = st.session_state.results_df.iloc[0:0]

@@ -39,15 +39,25 @@ if uploaded_file is not None:
         y_range = st.slider("Plage Verticale", 0, height, (int(height*0.1), int(height*0.9)))
         y_start, y_end = y_range
 
+    # Sécurité pour éviter les plantages si la largeur est à 0
+    if lane_width < 2:
+        st.warning("Veuillez augmenter la largeur de la piste.")
+        st.stop()
+
     x_start = max(0, x_center - lane_width // 2)
     x_end = min(width, x_center + lane_width // 2)
 
     # Extraction de l'image de la piste
     lane_gray = gray[y_start:y_end, x_start:x_end]
     lane_inverted = inverted_img[y_start:y_end, x_start:x_end]
+    
     # On passe la piste en RGB pour le Canvas
     lane_rgb = cv2.cvtColor(lane_gray, cv2.COLOR_GRAY2RGB)
     lane_pil = Image.fromarray(lane_rgb)
+
+    # CORRECTION CRUCIALE : Forcer les dimensions en entiers purs de Python
+    canvas_height = int(lane_pil.height)
+    canvas_width = int(lane_pil.width)
 
     st.markdown("---")
     col1, col2 = st.columns([1, 1.5])
@@ -57,7 +67,6 @@ if uploaded_file is not None:
         threshold_val = st.slider("Sensibilité de pré-détection", 0, 255, 50)
         min_area = st.slider("Surface minimale", 10, 1000, 50)
         
-        # Bouton pour générer le brouillon
         if st.button("🔄 Lancer l'Auto-Détection", type="primary"):
             _, binary_mask = cv2.threshold(lane_inverted, threshold_val, 255, cv2.THRESH_BINARY)
             contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -66,43 +75,39 @@ if uploaded_file is not None:
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
                 if w * h >= min_area:
-                    # Création du format JSON (Fabric.js) exigé par le Canvas interactif
                     canvas_objects.append({
                         "type": "rect",
-                        "left": x, "top": y, "width": w, "height": h,
-                        "fill": "rgba(0, 0, 0, 0)", # Intérieur transparent
+                        "left": float(x), "top": float(y), "width": float(w), "height": float(h),
+                        "fill": "rgba(0, 0, 0, 0)",
                         "stroke": "red",
                         "strokeWidth": 2,
                         "transparentCorners": False
                     })
             
-            # Stockage des boîtes en mémoire pour les envoyer au Canvas
             st.session_state["initial_drawing"] = {
                 "version": "4.4.0",
                 "objects": canvas_objects
             }
-            st.rerun() # Rafraîchit la page pour charger les boîtes
+            st.rerun()
 
     with col2:
-        st.subheader("2. La Toile Interactive (Correction & Validation)")
-        st.markdown("Mode de dessin : Utilisez **Transform** pour cliquer et modifier les boîtes rouges. Utilisez **Rect** pour en dessiner des nouvelles.")
+        st.subheader("2. La Toile Interactive (Correction)")
+        st.markdown("Utilisez **Modifier/Sélectionner** pour ajuster les boîtes rouges. Utilisez **Dessiner** pour en créer de nouvelles.")
         
-        # Outils du canvas
         drawing_mode = st.radio("Outil actif :", ("transform", "rect"), horizontal=True, 
                                 format_func=lambda x: "🖱️ Modifier/Sélectionner" if x == "transform" else "✏️ Dessiner Nouvelle Boîte")
 
-        # Initialisation vide si on n'a pas encore cliqué sur auto-détection
         initial_state = st.session_state.get("initial_drawing", {"version": "4.4.0", "objects": []})
 
         # --- LE CANVAS INTERACTIF ---
         canvas_result = st_canvas(
-            fill_color="rgba(0, 0, 0, 0)",  # Transparent
+            fill_color="rgba(0, 0, 0, 0)",
             stroke_width=2,
             stroke_color="red",
             background_image=lane_pil,
             update_streamlit=True,
-            height=lane_pil.height,
-            width=lane_pil.width,
+            height=canvas_height, # Utilisation des dimensions sécurisées
+            width=canvas_width,   # Utilisation des dimensions sécurisées
             drawing_mode=drawing_mode,
             initial_drawing=initial_state,
             key="canvas",
@@ -117,23 +122,19 @@ if uploaded_file is not None:
                 detected_bands_data = []
                 band_counter = 1
                 
-                # On récupère les coordonnées finales de toutes les boîtes (dessinées ou modifiées)
                 objects = canvas_result.json_data["objects"]
-                # On les trie de haut en bas (top)
                 objects = sorted(objects, key=lambda obj: obj["top"])
                 
                 for obj in objects:
                     if obj["type"] == "rect":
-                        # Extraction des coordonnées exactes depuis le Canvas
                         x = int(obj["left"])
                         y = int(obj["top"])
-                        w = int(obj["width"] * obj.get("scaleX", 1)) # Gère le redimensionnement
+                        w = int(obj["width"] * obj.get("scaleX", 1))
                         h = int(obj["height"] * obj.get("scaleY", 1))
                         
                         area = float(w * h)
                         
                         if area > 0:
-                            # Calcul 2D (Integrated Density) sur l'image inversée
                             band_pixels = lane_inverted[y:y+h, x:x+w]
                             raw_intden = np.sum(band_pixels, dtype=np.float64)
                             

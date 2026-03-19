@@ -12,14 +12,16 @@ if 'results_df' not in st.session_state:
 
 st.set_page_config(page_title="Quantificateur WB V9 (Détourage 2D)", layout="wide")
 st.title("🔬 Quantificateur 2D par Détourage Automatique (ROIs)")
-st.markdown("Encadrez la piste, puis réglez la détection pour que le logiciel **dessine des boîtes autour de vos bandes** et calcule leur volume total.")
+st.markdown("Encadrez la piste à gauche, puis réglez la détection à droite pour que le logiciel **dessine des boîtes autour de vos bandes** et calcule leur volume total (IntDen).")
 
+# --- Étape 1 : Chargement de l'image ---
 uploaded_file = st.file_uploader("Choisissez une image (JPG, PNG)", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
     image = Image.open(uploaded_file)
     img_array = np.array(image)
     
+    # Conversion en niveaux de gris
     if len(img_array.shape) == 3:
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     else:
@@ -34,7 +36,7 @@ if uploaded_file is not None:
     with col1:
         st.subheader("1. Définir la Piste (Colonne)")
         
-        # On définit maintenant un rectangle (et plus une ligne)
+        # On définit un rectangle englobant toute la piste
         x_center = st.slider("Position X (Centre de la piste)", 0, width, int(width/2))
         lane_width = st.slider("Largeur de la piste", 10, 200, 60, help="Doit englober toute la largeur de vos bandes.")
         
@@ -47,7 +49,7 @@ if uploaded_file is not None:
         # Extraction de la zone d'intérêt (La Piste)
         lane_roi = inverted_img[y_start:y_end, x_start:x_end]
         
-        # Affichage du cadre global
+        # Affichage du cadre global sur l'image d'origine
         img_display_global = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
         cv2.rectangle(img_display_global, (x_start, y_start), (x_end, y_end), (255, 0, 0), 2)
         st.image(img_display_global, caption="Piste sélectionnée", use_container_width=True)
@@ -66,50 +68,50 @@ if uploaded_file is not None:
         # 2. Recherche des contours sur le masque
         contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Image pour visualiser les boîtes (uniquement la piste découpée)
-        roi_display = cv2.cvtColor(255 - lane_roi, cv2.COLOR_GRAY2RGB) # Sur fond blanc original pour y voir clair
+        # Image pour visualiser les boîtes (uniquement la piste découpée, sur fond d'origine pour y voir clair)
+        roi_display = cv2.cvtColor(255 - lane_roi, cv2.COLOR_GRAY2RGB) 
         
         detected_bands_data = []
         
         # 3. Filtrage et dessin des boîtes
         band_counter = 1
-        # Trier les contours de haut en bas (selon Y)
+        # Trier les contours de haut en bas (selon Y) pour garder un ordre logique
         contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1])
         
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
-            area = w * h
+            area = float(w * h) # CORRECTION : Forcé en grand format pour éviter l'Overflow
             
             if area >= min_area:
                 # Dessin de la boîte 2D englobante (Bounding Box)
                 cv2.rectangle(roi_display, (x, y), (x+w, y+h), (0, 0, 255), 2)
                 cv2.putText(roi_display, f"B{band_counter}", (x, max(0, y-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                 
-                # --- CALCUL 2D (Integrated Density) ---
+                # --- CALCUL 2D (Integrated Density) CORRIGÉ ---
                 # Extraction des pixels *exactement* dans cette boîte
                 band_pixels = lane_roi[y:y+h, x:x+w]
                 
-                # Somme totale du signal (Volume Brut)
-                raw_intden = np.sum(band_pixels)
+                # Somme totale du signal forcé en float64
+                raw_intden = np.sum(band_pixels, dtype=np.float64)
                 
-                # Soustraction basique du bruit de fond local (valeur min de la boîte * surface)
-                local_bg = np.min(band_pixels)
+                # Soustraction du bruit de fond local forcé en float
+                local_bg = float(np.min(band_pixels)) if band_pixels.size > 0 else 0.0
                 total_bg = local_bg * area
                 net_intden = raw_intden - total_bg
                 
                 detected_bands_data.append({
                     "Bande": f"Bande {band_counter}",
-                    "Surface (Pixels²)": area,
-                    "Intensité brute (IntDen)": raw_intden,
-                    "Bruit de fond estimé": total_bg,
-                    "Intensité Nette": net_intden
+                    "Surface (Pixels²)": round(area, 2),
+                    "Intensité brute (IntDen)": round(raw_intden, 2),
+                    "Bruit de fond estimé": round(total_bg, 2),
+                    "Intensité Nette": round(net_intden, 2)
                 })
                 band_counter += 1
 
         # Affichage du résultat de la détection (Masque + Boîtes)
         subcol1, subcol2 = st.columns(2)
         with subcol1:
-            st.image(binary_mask, caption="Masque de détection (Vue Machine)", use_container_width=True)
+            st.image(binary_mask, caption="Masque (Vue Machine)", use_container_width=True)
         with subcol2:
             st.image(roi_display, caption=f"{len(detected_bands_data)} Bandes détourées", use_container_width=True)
 

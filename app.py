@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 import pandas as pd
-import io
+from scipy.signal import find_peaks
 
 # --- Liste standardisée de vos conditions ---
 CONDITIONS = [
@@ -13,18 +13,15 @@ CONDITIONS = [
     "D776N -", "D776N 2", "D776N 7", "D776N 15"
 ]
 
-st.set_page_config(page_title="Quantificateur WB V7 Flexible", layout="wide")
-st.title("🔬 Quantificateur Haut Débit Flexible (12 Puits)")
-st.markdown("Ciblez la grille, puis ajustez **chaque piste individuellement** si nécessaire pour corriger la migration.")
+# --- Initialisation de la mémoire ---
+if 'results_df' not in st.session_state:
+    st.session_state.results_df = pd.DataFrame(columns=[
+        "Puits N°", "Condition", "Nom du Pic", "X Absolu", "Y Début Bande", "Y Fin Bande", "Intensité (AUC)", "Bruit de fond"
+    ])
 
-# --- Initialisation de la mémoire (Session State) pour les ajustements individuels ---
-if 'lane_adjustments' not in st.session_state:
-    # On stocke les décalages (offsets) X, Y-top et Y-bottom pour chaque puits
-    st.session_state.lane_adjustments = {i: {"dx": 0, "dy_top": 0, "dy_bottom": 0} for i in range(12)}
-
-# Fonction pour réinitialiser les ajustements
-def reset_adjustments():
-    st.session_state.lane_adjustments = {i: {"dx": 0, "dy_top": 0, "dy_bottom": 0} for i in range(12)}
+st.set_page_config(page_title="Quantificateur WB V8 (Contrôle Visuel)", layout="wide")
+st.title("🔬 Quantificateur à Grille avec Contrôle des Pics (V8)")
+st.markdown("Placez la grille globale à gauche, puis inspectez et validez chaque puits à droite.")
 
 uploaded_file = st.file_uploader("Choisissez une image (JPG, PNG)", type=["jpg", "jpeg", "png"])
 
@@ -43,130 +40,139 @@ if uploaded_file is not None:
     col1, col2 = st.columns([1, 1])
 
     with col1:
-        st.subheader("1. Placer et Ajuster la Grille")
+        st.subheader("1. Placer la Grille Globale")
+        x_first = st.slider("Axe X : Première piste (EV -)", 0, width, int(width*0.1))
+        x_last = st.slider("Axe X : Dernière piste (D776N 15)", 0, width, int(width*0.9))
         
-        tab1, tab2 = st.tabs(["🏗️ Placement Global", "🔧 Ajustement Individuel"])
+        y_range = st.slider(
+            "Plage Verticale (Exclure les textes)", 
+            0, height, (int(height*0.1), int(height*0.9))
+        )
+        y_start, y_end = y_range
         
-        with tab1:
-            st.markdown("**Étape A :** Définir le contour de la grille et la zone verticale par défaut.")
-            x_first = st.slider("Axe X : Première piste (EV -)", 0, width, int(width*0.1))
-            x_last = st.slider("Axe X : Dernière piste (D776N 15)", 0, width, int(width*0.9))
-            
-            global_y_range = st.slider(
-                "Axe Y : Encadrer la protéine (Zone par défaut)", 
-                0, height, (int(height*0.4), int(height*0.5)),
-                help="Ajustez pour le 'gros' de la rangée de bandes."
-            )
-            g_y_start, g_y_end = global_y_range
+        if y_end <= y_start + 1:
+            st.error("Plage verticale invalide.")
+            st.stop()
 
-            if st.button("🗑️ Réinitialiser tous les ajustements individuels"):
-                reset_adjustments()
-                st.rerun()
+        # Calcul des 12 positions
+        x_positions = np.linspace(x_first, x_last, 12, dtype=int)
 
-        with tab2:
-            st.markdown("**Étape B :** Si une piste a bougé (X) ou a migré plus haut/bas (Y), corrigez-la ici.")
-            
-            # Sélection du puits à corriger
-            well_to_adjust = st.selectbox(
-                "Sélectionner la piste à corriger", 
-                options=range(1, 13), 
-                format_func=lambda i: f"Puits {i} ({CONDITIONS[i-1]})"
-            )
-            idx = well_to_adjust - 1
-            
-            # Curseurs pour ajuster cette piste spécifique (relativement à la grille par défaut)
-            st.markdown(f"**Ajustement pour {CONDITIONS[idx]} :**")
-            current_adj = st.session_state.lane_adjustments[idx]
-            
-            new_dx = st.slider("Ajustement X précis (Pix)", -50, 50, current_adj["dx"], key=f"dx_{idx}")
-            new_dy_top = st.slider("Ajustement Y-Haut ( Pix)", -100, 100, current_adj["dy_top"], key=f"dyt_{idx}", help="Monter (négatif) ou descendre (positif) le haut de la ligne.")
-            new_dy_bottom = st.slider("Ajustement Y-Bas (Pix)", -100, 100, current_adj["dy_bottom"], key=f"dyb_{idx}", help="Monter (négatif) ou descendre (positif) le bas de la ligne.")
-            
-            # Mise à jour de la mémoire
-            st.session_state.lane_adjustments[idx] = {"dx": new_dx, "dy_top": new_dy_top, "dy_bottom": new_dy_bottom}
-
-        # --- CALCUL ET DESSIN DE LA GRILLE FLEXIBLE ---
-        # 1. Grille théorique de base (linspace)
-        base_x_positions = np.linspace(x_first, x_last, 12, dtype=int)
-        
-        # 2. Application des ajustements pour créer la grille RÉELLE
-        actual_lanes = []
-        for i, x_base in enumerate(base_x_positions):
-            adj = st.session_state.lane_adjustments[i]
-            actual_x = x_base + adj["dx"]
-            actual_y_start = g_y_start + adj["dy_top"]
-            actual_y_end = g_y_end + adj["dy_bottom"]
-            
-            # Sécurité pour ne pas sortir de l'image
-            actual_x = max(0, min(width, actual_x))
-            actual_y_start = max(0, min(height, actual_y_start))
-            actual_y_end = max(0, min(height, actual_y_end))
-            
-            actual_lanes.append({"x": actual_x, "y_start": actual_y_start, "y_end": actual_y_end})
-
-        # Dessin de la grille flexible
+        # Dessin de la grille
         img_display = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
         
-        # Rectangle global par défaut (pointillé)
-        cv2.rectangle(img_display, (x_first, g_y_start), (x_last, g_y_end), (100, 100, 100), 2, cv2.LINE_AA)
+        # Rectangle de la zone de recherche
+        cv2.rectangle(img_display, (x_first-15, y_start), (x_last+15, y_end), (100, 100, 100), 2, cv2.LINE_AA)
         
-        # Dessiner les 12 segments FLEXIBLES
-        for i, lane in enumerate(actual_lanes):
-            # Couleur spéciale pour la piste en cours d'ajustement (Rouge) vs les autres (Bleu)
-            color = (0, 0, 255) if i == idx else (255, 0, 0)
-            thickness = 4 if i == idx else 2
-            
-            # Dessiner le segment de lecture
-            cv2.line(img_display, (lane["x"], lane["y_start"]), (lane["x"], lane["y_end"]), color, thickness)
-            
-            # Marqueurs de début/fin
-            cv2.circle(img_display, (lane["x"], lane["y_start"]), 5, color, -1)
-            cv2.circle(img_display, (lane["x"], lane["y_end"]), 5, color, thickness)
-            
-            # Petit numéro du puits
-            cv2.putText(img_display, str(i+1), (lane["x"]-15, lane["y_start"]-15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, thickness)
+        for i, x in enumerate(x_positions):
+            cv2.line(img_display, (x, y_start), (x, y_end), (255, 0, 0), 2)
+            cv2.putText(img_display, str(i+1), (x-10, y_start-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-        st.image(img_display, caption="Grille de lecture flexible ajustée", use_container_width=True)
+        st.image(img_display, caption="Grille de lecture (12 puits)", use_container_width=True)
 
     with col2:
-        st.subheader("2. Résultats Instantanés")
+        # --- SÉLECTION DU PUITS À INSPECTER ---
+        selected_well = st.selectbox(
+            "2. Sélectionner le puits à inspecter et valider", 
+            options=range(12), 
+            format_func=lambda x: f"Puits {x+1} : {CONDITIONS[x]}"
+        )
         
-        # Calcul en boucle sur la grille FLEXIBLE
-        results_list = []
-        for i, lane in enumerate(actual_lanes):
-            # Extraction du profil de la bande pour cette piste SPÉCIFIQUE
-            band_profile = inverted_img[lane["y_start"]:lane["y_end"], lane["x"]]
+        current_x = x_positions[selected_well]
+        active_profile = inverted_img[y_start:y_end, current_x]
+        profile_len = len(active_profile)
+
+        st.markdown(f"**Analyse du profil (X = {current_x}) :**")
+        
+        # --- CURSEURS DE SENSIBILITÉ ---
+        col_thresh, col_width = st.columns(2)
+        with col_thresh:
+            threshold = st.slider("Sensibilité (Intensité min)", 0, 255, 30)
+        with col_width:
+            min_width = st.slider("Largeur min du pic", 1, 100, 10)
+
+        # --- DÉTECTION ET GRAPHIQUE ---
+        peaks, properties = find_peaks(active_profile, height=threshold, width=min_width)
+        num_peaks = len(peaks)
+
+        fig, ax = plt.subplots(figsize=(5, 6))
+        ax.plot(active_profile, range(profile_len), color='black', label="Profil d'intensité")
+        
+        peaks_data_for_this_well = []
+        
+        for i in range(num_peaks):
+            peak_relative_y = peaks[i]
+            peak_left = int(properties["left_bases"][i])
+            peak_right = int(properties["right_bases"][i])
             
-            if len(band_profile) > 0:
-                local_background = np.min(band_profile)
-                net_profile = band_profile - local_background
-                area = np.trapezoid(net_profile)
-            else:
-                area, local_background = 0, 0
-                
-            results_list.append({
-                "Puits N°": i + 1,
-                "Condition": CONDITIONS[i],
-                "X Absolu": lane["x"],
-                "Y-Haut Absolu": lane["y_start"],
-                "Y-Bas Absolu": lane["y_end"],
+            # Colorier le pic
+            ax.fill_betweenx(range(peak_left, peak_right), 0, active_profile[peak_left:peak_right], color='blue', alpha=0.3)
+            ax.scatter(active_profile[peak_relative_y], peak_relative_y, color='blue', marker='o', s=50, edgecolors='white', linewidths=1)
+            
+            # Calcul de l'AUC pour ce pic
+            band_profile = active_profile[peak_left:peak_right]
+            local_background = np.min(band_profile) if len(band_profile) > 0 else 0
+            net_profile = band_profile - local_background
+            area = np.trapezoid(net_profile) if len(net_profile) > 0 else 0
+            
+            peaks_data_for_this_well.append({
+                "Puits N°": selected_well + 1,
+                "Condition": CONDITIONS[selected_well],
+                "X Absolu": current_x,
+                "Y Début Bande": y_start + peak_left,
+                "Y Fin Bande": y_start + peak_right,
                 "Intensité (AUC)": round(area, 2),
                 "Bruit de fond": round(local_background, 2)
             })
 
-        # Création du DataFrame
-        df_results = pd.DataFrame(results_list)
+        ax.set_ylim(profile_len, 0) 
+        max_intensity = np.max(active_profile) if np.max(active_profile) > 0 else 255
+        ax.set_xlim(0, max_intensity * 1.1)
+        ax.set_ylabel("Position Relative (Pixels)")
+        ax.set_xlabel("Intensité")
         
-        # Nom de la protéine pour l'export
-        protein_name = st.text_input("Protéine quantifiée (ex: p-PLCG1)", value="Protéine_Inconnue")
+        handles, labels = ax.get_legend_handles_labels()
+        if num_peaks > 0:
+            h, = ax.plot([], [], color='blue', marker='o', linestyle='None')
+            handles.append(h)
+            labels.append(f"Pics détectés ({num_peaks})")
+        ax.legend(handles, labels)
         
-        st.dataframe(df_results, use_container_width=True)
+        st.pyplot(fig)
+
+        # --- ENREGISTREMENT ---
+        st.markdown("---")
+        protein_name = st.text_input("Nom de la protéine ciblée (ex: p-PLCG1)", key=f"prot_{selected_well}")
         
-        # Bouton d'export CSV
-        csv = df_results.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label=f"📥 Télécharger les 12 intensités ({protein_name})",
-            data=csv,
-            file_name=f"Quantification_{protein_name}.csv",
-            mime="text/csv",
-        )
+        if st.button(f"➕ Valider et ajouter le puits {selected_well + 1} au tableau", type="primary"):
+            if num_peaks > 0:
+                new_data_list = []
+                for idx, peak_data in enumerate(peaks_data_for_this_well):
+                    peak_data_named = peak_data.copy()
+                    # On nomme le pic si plusieurs sont détectés
+                    peak_suffix = f" (Pic {idx+1})" if num_peaks > 1 else ""
+                    peak_data_named["Nom du Pic"] = f"{protein_name}{peak_suffix}" if protein_name else f"Inconnu{peak_suffix}"
+                    new_data_list.append(peak_data_named)
+                
+                new_data_df = pd.DataFrame(new_data_list)
+                st.session_state.results_df = pd.concat([st.session_state.results_df, new_data_df], ignore_index=True)
+                st.success(f"Puits {selected_well + 1} enregistré ! Passez au suivant.")
+            else:
+                st.warning("Aucun pic détecté à enregistrer.")
+
+# --- AFFICHAGE ET EXPORT DU TABLEAU GLOBAL ---
+if not st.session_state.results_df.empty:
+    st.markdown("---")
+    st.subheader("📊 Tableau de Synthèse")
+    st.dataframe(st.session_state.results_df, use_container_width=True)
+    
+    csv = st.session_state.results_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Télécharger la synthèse (CSV)",
+        data=csv,
+        file_name="Quantification_Complete.csv",
+        mime="text/csv",
+    )
+    
+    if st.button("🗑️ Vider le tableau"):
+        st.session_state.results_df = st.session_state.results_df.iloc[0:0]
+        st.rerun()

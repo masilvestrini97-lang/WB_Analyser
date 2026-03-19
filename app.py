@@ -3,147 +3,168 @@ import cv2
 import numpy as np
 from PIL import Image
 import pandas as pd
+from streamlit_drawable_canvas import st_canvas
 
 # --- Initialisation de la mémoire ---
 if 'results_df' not in st.session_state:
     st.session_state.results_df = pd.DataFrame(columns=[
-        "Condition", "Bande", "Surface (Pixels²)", "Intensité brute (IntDen)", "Bruit de fond estimé", "Intensité Nette"
+        "Condition", "Bande", "Surface (Pixels²)", "Intensité brute", "Bruit de fond", "Intensité Nette"
     ])
 
-st.set_page_config(page_title="Quantificateur WB V9 (Détourage 2D)", layout="wide")
-st.title("🔬 Quantificateur 2D par Détourage Automatique (ROIs)")
-st.markdown("Encadrez la piste à gauche, puis réglez la détection à droite pour que le logiciel **dessine des boîtes autour de vos bandes** et calcule leur volume total (IntDen).")
+st.set_page_config(page_title="Quantificateur WB V10 (Toile Interactive)", layout="wide")
+st.title("🔬 Quantificateur 2D : Détection + Édition Manuelle")
+st.markdown("Laissez l'algorithme proposer des boîtes (à gauche), puis **ajustez-les, supprimez-les ou dessinez-en de nouvelles** directement avec la souris (à droite).")
 
-# --- Étape 1 : Chargement de l'image ---
 uploaded_file = st.file_uploader("Choisissez une image (JPG, PNG)", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
     image = Image.open(uploaded_file)
     img_array = np.array(image)
     
-    # Conversion en niveaux de gris
     if len(img_array.shape) == 3:
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     else:
         gray = img_array
 
-    # Inversion : le noir devient du signal positif (0-255)
     inverted_img = 255 - gray
     height, width = inverted_img.shape
 
-    col1, col2 = st.columns([1, 1])
-
-    with col1:
-        st.subheader("1. Définir la Piste (Colonne)")
-        
-        # On définit un rectangle englobant toute la piste
+    # --- ÉTAPE 1 : DÉFINITION DE LA PISTE ---
+    st.markdown("---")
+    col_setup1, col_setup2 = st.columns(2)
+    with col_setup1:
         x_center = st.slider("Position X (Centre de la piste)", 0, width, int(width/2))
-        lane_width = st.slider("Largeur de la piste", 10, 200, 60, help="Doit englober toute la largeur de vos bandes.")
-        
+        lane_width = st.slider("Largeur de la piste", 10, 200, 60)
+    with col_setup2:
         y_range = st.slider("Plage Verticale", 0, height, (int(height*0.1), int(height*0.9)))
         y_start, y_end = y_range
-        
-        x_start = max(0, x_center - lane_width // 2)
-        x_end = min(width, x_center + lane_width // 2)
 
-        # Extraction de la zone d'intérêt (La Piste)
-        lane_roi = inverted_img[y_start:y_end, x_start:x_end]
+    x_start = max(0, x_center - lane_width // 2)
+    x_end = min(width, x_center + lane_width // 2)
+
+    # Extraction de l'image de la piste
+    lane_gray = gray[y_start:y_end, x_start:x_end]
+    lane_inverted = inverted_img[y_start:y_end, x_start:x_end]
+    # On passe la piste en RGB pour le Canvas
+    lane_rgb = cv2.cvtColor(lane_gray, cv2.COLOR_GRAY2RGB)
+    lane_pil = Image.fromarray(lane_rgb)
+
+    st.markdown("---")
+    col1, col2 = st.columns([1, 1.5])
+
+    with col1:
+        st.subheader("1. Auto-Détection (Le Brouillon)")
+        threshold_val = st.slider("Sensibilité de pré-détection", 0, 255, 50)
+        min_area = st.slider("Surface minimale", 10, 1000, 50)
         
-        # Affichage du cadre global sur l'image d'origine
-        img_display_global = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-        cv2.rectangle(img_display_global, (x_start, y_start), (x_end, y_end), (255, 0, 0), 2)
-        st.image(img_display_global, caption="Piste sélectionnée", use_container_width=True)
+        # Bouton pour générer le brouillon
+        if st.button("🔄 Lancer l'Auto-Détection", type="primary"):
+            _, binary_mask = cv2.threshold(lane_inverted, threshold_val, 255, cv2.THRESH_BINARY)
+            contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            canvas_objects = []
+            for contour in contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                if w * h >= min_area:
+                    # Création du format JSON (Fabric.js) exigé par le Canvas interactif
+                    canvas_objects.append({
+                        "type": "rect",
+                        "left": x, "top": y, "width": w, "height": h,
+                        "fill": "rgba(0, 0, 0, 0)", # Intérieur transparent
+                        "stroke": "red",
+                        "strokeWidth": 2,
+                        "transparentCorners": False
+                    })
+            
+            # Stockage des boîtes en mémoire pour les envoyer au Canvas
+            st.session_state["initial_drawing"] = {
+                "version": "4.4.0",
+                "objects": canvas_objects
+            }
+            st.rerun() # Rafraîchit la page pour charger les boîtes
 
     with col2:
-        st.subheader("2. Détourage Semi-Automatique des Bandes")
+        st.subheader("2. La Toile Interactive (Correction & Validation)")
+        st.markdown("Mode de dessin : Utilisez **Transform** pour cliquer et modifier les boîtes rouges. Utilisez **Rect** pour en dessiner des nouvelles.")
         
-        # --- RÉGLAGES DE DÉTECTION 2D ---
-        st.markdown("Ajustez ces curseurs pour encadrer parfaitement les bandes.")
-        threshold_val = st.slider("Seuil de détection (Sensibilité)", 0, 255, 50, help="Plus c'est haut, plus seules les bandes très noires seront détourées.")
-        min_area = st.slider("Surface minimale (exclure les poussières)", 10, 1000, 100)
+        # Outils du canvas
+        drawing_mode = st.radio("Outil actif :", ("transform", "rect"), horizontal=True, 
+                                format_func=lambda x: "🖱️ Modifier/Sélectionner" if x == "transform" else "✏️ Dessiner Nouvelle Boîte")
 
-        # 1. Binarisation de l'image (création d'un masque)
-        _, binary_mask = cv2.threshold(lane_roi, threshold_val, 255, cv2.THRESH_BINARY)
-        
-        # 2. Recherche des contours sur le masque
-        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Image pour visualiser les boîtes (uniquement la piste découpée, sur fond d'origine pour y voir clair)
-        roi_display = cv2.cvtColor(255 - lane_roi, cv2.COLOR_GRAY2RGB) 
-        
-        detected_bands_data = []
-        
-        # 3. Filtrage et dessin des boîtes
-        band_counter = 1
-        # Trier les contours de haut en bas (selon Y) pour garder un ordre logique
-        contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1])
-        
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            area = float(w * h) # CORRECTION : Forcé en grand format pour éviter l'Overflow
-            
-            if area >= min_area:
-                # Dessin de la boîte 2D englobante (Bounding Box)
-                cv2.rectangle(roi_display, (x, y), (x+w, y+h), (0, 0, 255), 2)
-                cv2.putText(roi_display, f"B{band_counter}", (x, max(0, y-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                
-                # --- CALCUL 2D (Integrated Density) CORRIGÉ ---
-                # Extraction des pixels *exactement* dans cette boîte
-                band_pixels = lane_roi[y:y+h, x:x+w]
-                
-                # Somme totale du signal forcé en float64
-                raw_intden = np.sum(band_pixels, dtype=np.float64)
-                
-                # Soustraction du bruit de fond local forcé en float
-                local_bg = float(np.min(band_pixels)) if band_pixels.size > 0 else 0.0
-                total_bg = local_bg * area
-                net_intden = raw_intden - total_bg
-                
-                detected_bands_data.append({
-                    "Bande": f"Bande {band_counter}",
-                    "Surface (Pixels²)": round(area, 2),
-                    "Intensité brute (IntDen)": round(raw_intden, 2),
-                    "Bruit de fond estimé": round(total_bg, 2),
-                    "Intensité Nette": round(net_intden, 2)
-                })
-                band_counter += 1
+        # Initialisation vide si on n'a pas encore cliqué sur auto-détection
+        initial_state = st.session_state.get("initial_drawing", {"version": "4.4.0", "objects": []})
 
-        # Affichage du résultat de la détection (Masque + Boîtes)
-        subcol1, subcol2 = st.columns(2)
-        with subcol1:
-            st.image(binary_mask, caption="Masque (Vue Machine)", use_container_width=True)
-        with subcol2:
-            st.image(roi_display, caption=f"{len(detected_bands_data)} Bandes détourées", use_container_width=True)
+        # --- LE CANVAS INTERACTIF ---
+        canvas_result = st_canvas(
+            fill_color="rgba(0, 0, 0, 0)",  # Transparent
+            stroke_width=2,
+            stroke_color="red",
+            background_image=lane_pil,
+            update_streamlit=True,
+            height=lane_pil.height,
+            width=lane_pil.width,
+            drawing_mode=drawing_mode,
+            initial_drawing=initial_state,
+            key="canvas",
+        )
 
-        # --- ENREGISTREMENT ---
+        # --- CALCUL ET ENREGISTREMENT ---
         st.markdown("---")
         condition_name = st.text_input("Nom de la piste (ex: WT 7min)")
         
-        if st.button("➕ Enregistrer ces bandes au tableau", type="primary"):
-            if len(detected_bands_data) > 0 and condition_name:
-                # Ajout du nom de la condition
-                for b_data in detected_bands_data:
-                    b_data["Condition"] = condition_name
+        if st.button("✅ Calculer et Enregistrer ces Boîtes"):
+            if canvas_result.json_data is not None and len(canvas_result.json_data["objects"]) > 0:
+                detected_bands_data = []
+                band_counter = 1
+                
+                # On récupère les coordonnées finales de toutes les boîtes (dessinées ou modifiées)
+                objects = canvas_result.json_data["objects"]
+                # On les trie de haut en bas (top)
+                objects = sorted(objects, key=lambda obj: obj["top"])
+                
+                for obj in objects:
+                    if obj["type"] == "rect":
+                        # Extraction des coordonnées exactes depuis le Canvas
+                        x = int(obj["left"])
+                        y = int(obj["top"])
+                        w = int(obj["width"] * obj.get("scaleX", 1)) # Gère le redimensionnement
+                        h = int(obj["height"] * obj.get("scaleY", 1))
+                        
+                        area = float(w * h)
+                        
+                        if area > 0:
+                            # Calcul 2D (Integrated Density) sur l'image inversée
+                            band_pixels = lane_inverted[y:y+h, x:x+w]
+                            raw_intden = np.sum(band_pixels, dtype=np.float64)
+                            
+                            local_bg = float(np.min(band_pixels)) if band_pixels.size > 0 else 0.0
+                            total_bg = local_bg * area
+                            net_intden = raw_intden - total_bg
+                            
+                            detected_bands_data.append({
+                                "Condition": condition_name if condition_name else "Inconnue",
+                                "Bande": f"Bande {band_counter}",
+                                "Surface (Pixels²)": round(area, 2),
+                                "Intensité brute": round(raw_intden, 2),
+                                "Bruit de fond": round(total_bg, 2),
+                                "Intensité Nette": round(net_intden, 2)
+                            })
+                            band_counter += 1
                 
                 new_data_df = pd.DataFrame(detected_bands_data)
                 st.session_state.results_df = pd.concat([st.session_state.results_df, new_data_df], ignore_index=True)
-                st.success("Bandes enregistrées !")
+                st.success(f"{band_counter-1} bandes calculées et enregistrées !")
             else:
-                st.warning("Veuillez entrer un nom de condition ou ajuster le seuil pour détecter des bandes.")
+                st.warning("Aucune boîte n'est présente sur l'image.")
 
-# --- AFFICHAGE ET EXPORT DU TABLEAU ---
+# --- AFFICHAGE ET EXPORT ---
 if not st.session_state.results_df.empty:
     st.markdown("---")
     st.subheader("📊 Tableau de Synthèse (Densitométrie 2D)")
     st.dataframe(st.session_state.results_df, use_container_width=True)
     
     csv = st.session_state.results_df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📥 Télécharger la quantification 2D (CSV)",
-        data=csv,
-        file_name="Quantification_2D_ROIs.csv",
-        mime="text/csv",
-    )
+    st.download_button("📥 Télécharger (CSV)", data=csv, file_name="Quantification_2D_Interactive.csv", mime="text/csv")
     
     if st.button("🗑️ Vider le tableau"):
         st.session_state.results_df = st.session_state.results_df.iloc[0:0]
